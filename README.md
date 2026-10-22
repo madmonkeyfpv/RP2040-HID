@@ -21,8 +21,9 @@ buttons, polled every 1 ms. Axes without a pin report their centre value.
 | Arduino Leonardo / Micro | 17 (D0–D13, MISO, SCK, MOSI) | 6 (A0–A5), 10-bit |
 | Arduino Pro Micro | 14 (0–10, 14–16) | 4 (A0–A3), 10-bit |
 
-These chips have fewer pins than a BU0836X, so you get fewer inputs. The protocol and
-behaviour are the same.
+These chips have fewer pins than a BU0836X. To get the full **8 axes and 32 buttons**, add
+an MCP3208 ADC and/or 74HC165 shift registers. See [Expansion](#expansion-full-bu0836x-count)
+below.
 
 > **Uno / Nano / Mega won't work.** Their ATmega328P/2560 has no native USB, so it can't
 > act as a joystick. Use a 32U4 board or an RP2040.
@@ -80,11 +81,61 @@ uploads keep working. In `joy.cpl` it appears under the board's name (e.g. "Ardu
 
 ---
 
+## Expansion: full BU0836X count
+
+Two cheap chips, each switched on with one line in `config.h`. The pins they use are
+removed from the button list automatically.
+
+### MCP3208: 8 × 12-bit axes (`MCP3208_ENABLED 1`)
+
+Its channels become the first axes (CH0 = X … CH7 = Dial). The board's own analog pins fill
+any axes still free; if there are none, they become extra buttons. An MCP3204 (4 channels)
+works too: set `MCP3208_CHANNELS 4`.
+
+| MCP3208 pin | Pico (3.3 V) | RP2040-Zero | Leonardo / Micro / Pro Micro (5 V) |
+|---|---|---|---|
+| VDD (16), VREF (15) | 3V3(OUT) | 3V3 | VCC / 5V |
+| AGND (14), DGND (9) | GND | GND | GND |
+| CLK (13) | GP18 | GP6 | SCK (15) |
+| DOUT (12) | GP16 | GP4 | MISO (14) |
+| DIN (11) | GP19 | GP7 | MOSI (16) |
+| CS/SHDN (10) | GP17 | GP5 | 10 |
+| CH0–CH7 (1–8) | pot wipers | pot wipers | pot wipers |
+
+Fit a 100 nF capacitor between VDD and GND close to the chip, and wire each pot's ends to
+the same VREF supply and GND. On the RP2040 you can move the SPI pins, but they must belong
+to one hardware SPI block (the build tells you if they don't). On a Leonardo, SCK, MISO and
+MOSI are on the 6-pin ICSP header.
+
+### 74HC165 shift registers: 8 buttons per chip (`SHIFT_REG_ENABLED 1`)
+
+Four chips give 32 buttons from 3 pins. Shift register inputs come first: chip 1's A–H are
+inputs/buttons 1–8, chip 2's are 9–16, and so on. The board's own pins come after them.
+Once all 32 buttons are taken, those pins can still be used for the hat or encoders.
+
+| 74HC165 pin | Pico | RP2040-Zero | Arduino | Notes |
+|---|---|---|---|---|
+| QH (9), chip 1 | GP20 | GP8 | 5 | DATA |
+| CLK (2), all chips | GP21 | GP9 | 6 | |
+| SH/LD (1), all chips | GP22 | GP10 | 7 | LOAD |
+| CLK INH (15) | GND | GND | GND | |
+| SER (10) | | | | chip *n*'s SER ← chip *n+1*'s QH; last chip's SER → VCC |
+| VCC (16) / GND (8) | **3V3** | **3V3** | 5V | |
+| A–H (11–14, 3–6) | switches | switches | switches | 10 kΩ pull-up to VCC on each, switch to GND |
+
+**On an RP2040, power the 74HC165s from 3V3, not 5 V.** RP2040 pins aren't 5 V tolerant.
+The 74HC165 has no internal pull-ups, so every input needs its own resistor; 9-pin 10 kΩ
+resistor networks (SIP) make this tidy.
+
+Encoders wired to shift register inputs work too: the chain is re-read on every pass of
+the main loop when an encoder uses it.
+
 ## Optional modes (like the Bodnar configuration utility)
 
 On a fresh BU0836X every input is a plain button. The same input modes you'd set in Leo
 Bodnar's configuration utility can be turned on in `config.h`. They use **input numbers**
-(= button numbers), so button numbering never shifts:
+(= button numbers), so button numbering never shifts. With shift registers enabled, input 1
+is shift register input 1; otherwise it's the board's first pin.
 
 - `ENCODER_INPUTS { {1, 2} }`: inputs 1 and 2 read a rotary encoder. Each detent gives
   a short press on button 1 (one way) or button 2 (the other way). `ENCODER_STEPS_PER_DETENT`
@@ -108,7 +159,7 @@ Rebuild/re-upload after changing them.
 rp2040/                 Pico SDK + TinyUSB firmware (CMake)
   src/config.h          pin layout per board, optional modes
   src/hid_report.h      HID report descriptor (BU0836X layout)
-  src/main.c            input scanning, debouncing, encoders, ADC
+  src/main.c            input scanning, debouncing, encoders, ADC, MCP3208, 74HC165
   src/usb_descriptors.c USB device/config/string descriptors
 arduino/HIDJoystick/    Arduino sketch for ATmega32U4 boards
 .github/workflows/      CI that builds the .uf2 files and checks the sketch compiles

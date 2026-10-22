@@ -10,6 +10,10 @@
 //
 //  The pin lists are picked automatically from the board you build for
 //  (-DPICO_BOARD=...). Pin numbers are GPIO numbers ("GPxx").
+//
+//  Need the full BU0836X count (8 axes, 32 buttons)? Turn on the MCP3208 ADC
+//  and/or the 74HC165 shift registers below. The pins they use are taken out
+//  of the button list automatically.
 // =============================================================================
 #pragma once
 
@@ -20,6 +24,13 @@
 #define DIGITAL_INPUT_PINS  { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, \
                               17, 18, 19, 20, 21, 22, 23, 24, 25 }
 #define ANALOG_INPUT_PINS   { 26, 27, 28, 29 }
+#define DEFAULT_MCP3208_MISO 4
+#define DEFAULT_MCP3208_CS   5
+#define DEFAULT_MCP3208_SCK  6
+#define DEFAULT_MCP3208_MOSI 7
+#define DEFAULT_SR_DATA      8
+#define DEFAULT_SR_CLK       9
+#define DEFAULT_SR_LOAD      10
 
 #else
 // Raspberry Pi Pico, Pico W, Pico 2, Pico 2 W, and the default for other
@@ -27,11 +38,48 @@
 #define DIGITAL_INPUT_PINS  { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, \
                               16, 17, 18, 19, 20, 21, 22 }
 #define ANALOG_INPUT_PINS   { 26, 27, 28 }
+#define DEFAULT_MCP3208_MISO 16
+#define DEFAULT_MCP3208_CS   17
+#define DEFAULT_MCP3208_SCK  18
+#define DEFAULT_MCP3208_MOSI 19
+#define DEFAULT_SR_DATA      20
+#define DEFAULT_SR_CLK       21
+#define DEFAULT_SR_LOAD      22
 #endif
+
+// ---- MCP3208 external ADC: 8 more 12-bit axes ---------------------------------
+// Power the MCP3208 from 3V3 (VDD and VREF), AGND/DGND to GND, 100 nF across
+// VDD-GND, CLK/DOUT/DIN/CS to the pins below, pot wipers to CH0-CH7.
+// Its channels become the first axes (CH0 = X, CH1 = Y, ...); the board's own
+// ADC pins fill any axes left over, then become extra digital inputs.
+// An MCP3204 works too: set MCP3208_CHANNELS to 4.
+#define MCP3208_ENABLED     0
+#define MCP3208_CHANNELS    8
+// MISO, SCK and MOSI must be pins of one hardware SPI block: MISO = GPn with
+// n%4 == 0, SCK n%4 == 2, MOSI n%4 == 3 (the build checks this). CS can be any.
+#define MCP3208_MISO_PIN    DEFAULT_MCP3208_MISO    // to chip DOUT
+#define MCP3208_CS_PIN      DEFAULT_MCP3208_CS      // to chip CS/SHDN
+#define MCP3208_SCK_PIN     DEFAULT_MCP3208_SCK     // to chip CLK
+#define MCP3208_MOSI_PIN    DEFAULT_MCP3208_MOSI    // to chip DIN
+
+// ---- 74HC165 shift registers: 8 buttons per chip ------------------------------
+// Chain the chips: chip 1's QH goes to DATA, chip 2's QH to chip 1's SER, and
+// so on; tie the last chip's SER to 3V3. All chips share CLK and SH/LD (LOAD);
+// tie CLK INH to GND. Power them from 3V3 (not 5 V) and give every input a
+// 10k pull-up to 3V3, with the switch to GND.
+// Shift register inputs come first: chip 1's A..H are inputs 1-8, chip 2's
+// are 9-16, ... The board's own pins follow (they can still be used for the
+// hat or encoders once all 32 buttons are taken).
+#define SHIFT_REG_ENABLED   0
+#define SHIFT_REG_CHIPS     4
+#define SHIFT_REG_DATA_PIN  DEFAULT_SR_DATA         // to chip 1 QH
+#define SHIFT_REG_CLK_PIN   DEFAULT_SR_CLK          // to every CLK
+#define SHIFT_REG_LOAD_PIN  DEFAULT_SR_LOAD         // to every SH/LD
 
 // ---- Optional input modes (off by default, as on a fresh BU0836X) ------------
 // These match the options in Leo Bodnar's configuration utility. They refer
-// to INPUT numbers (1 = first entry of DIGITAL_INPUT_PINS), not GPIOs.
+// to INPUT numbers (= button numbers), not GPIOs. Input 1 is the first entry
+// of DIGITAL_INPUT_PINS, or shift register input 1 when those are enabled.
 
 // Rotary encoders: pairs of inputs {A, B}. The two buttons then give a short
 // press per detent (A's button = one direction, B's = the other).

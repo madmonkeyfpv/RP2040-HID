@@ -7,6 +7,10 @@
 //      Wire a pot's ends to VCC and GND, wiper to the pin.
 //    - Every other pin is a button. Wire a switch between the pin and GND
 //      (internal pull-ups, no resistors needed). Input N = joystick button N.
+//
+//  Need the full BU0836X count (8 axes, 32 buttons)? Turn on the MCP3208 ADC
+//  and/or the 74HC165 shift registers below. The pins they use are taken out
+//  of the button list automatically.
 // =============================================================================
 #pragma once
 
@@ -27,9 +31,35 @@
 #define ANALOG_INPUT_PINS   { A0, A1, A2, A3, A4, A5 }
 #endif
 
+// ---- MCP3208 external ADC: 8 more 12-bit axes ---------------------------------
+// Uses the hardware SPI pins: MISO (14) to chip DOUT, SCK (15) to CLK, MOSI
+// (16) to DIN, plus a chip-select pin of your choice. On a Leonardo those
+// three are on the ICSP header. Power the chip from 5V (VDD and VREF),
+// AGND/DGND to GND, 100 nF across VDD-GND, pot wipers to CH0-CH7.
+// Its channels become the first axes (CH0 = X, CH1 = Y, ...); the board's own
+// analog pins fill any axes left over, then become extra digital inputs.
+// An MCP3204 works too: set MCP3208_CHANNELS to 4.
+#define MCP3208_ENABLED     0
+#define MCP3208_CHANNELS    8
+#define MCP3208_CS_PIN      10
+
+// ---- 74HC165 shift registers: 8 buttons per chip ------------------------------
+// Chain the chips: chip 1's QH goes to DATA, chip 2's QH to chip 1's SER, and
+// so on; tie the last chip's SER to VCC. All chips share CLK and SH/LD (LOAD);
+// tie CLK INH to GND. Give every input a 10k pull-up to VCC, switch to GND.
+// Shift register inputs come first: chip 1's A..H are inputs 1-8, chip 2's
+// are 9-16, ... The board's own pins follow (they can still be used for the
+// hat or encoders once all 32 buttons are taken).
+#define SHIFT_REG_ENABLED   0
+#define SHIFT_REG_CHIPS     4               // 1-4
+#define SHIFT_REG_DATA_PIN  5               // to chip 1 QH
+#define SHIFT_REG_CLK_PIN   6               // to every CLK
+#define SHIFT_REG_LOAD_PIN  7               // to every SH/LD
+
 // ---- Optional input modes (off by default, as on a fresh BU0836X) ------------
 // These match the options in Leo Bodnar's configuration utility. They refer
-// to INPUT numbers (1 = first entry of DIGITAL_INPUT_PINS), not pins.
+// to INPUT numbers (= button numbers), not pins. Input 1 is the first entry
+// of DIGITAL_INPUT_PINS, or shift register input 1 when those are enabled.
 
 // Rotary encoders: pairs of inputs {A, B}. The two buttons then give a short
 // press per detent (A's button = one direction, B's = the other).

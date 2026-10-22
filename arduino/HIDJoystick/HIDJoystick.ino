@@ -1,8 +1,8 @@
 // HIDJoystick: turns an ATmega32U4 Arduino (Leonardo, Micro, Pro Micro) into a
 // native USB HID joystick that behaves like a Leo Bodnar BU0836X: every analog
-// pin is an axis, every other usable pin is a button. See config.h. Uses only
-// the HID library built into the Arduino AVR core, so there is nothing extra to
-// install.
+// pin is an axis, every other usable pin is a button, optionally extended with
+// an MCP3208 ADC and 74HC165 shift registers. See config.h. Uses only
+// libraries built into the Arduino AVR core, so there is nothing to install.
 
 #if !defined(USBCON)
 #error "This sketch needs a board with native USB (ATmega32U4: Leonardo, Micro, Pro Micro). An Uno/Nano cannot act as a USB joystick."
@@ -12,6 +12,10 @@
 
 #include "joystick.h"
 #include "config.h"
+
+#if MCP3208_ENABLED
+#include <SPI.h>
+#endif
 
 #define COUNT_OF(a) (sizeof(a) / sizeof((a)[0]))
 
@@ -24,13 +28,29 @@ static const uint8_t hatInputs[] = HAT_INPUTS;
 static const uint8_t hatInputs[] = {};
 #endif
 
-#define NUM_INPUTS   COUNT_OF(digitalPins)
-#define NUM_AXES     COUNT_OF(analogPins)
 #define NUM_ENCODERS COUNT_OF(encoderCfg)
 #define NUM_HAT      COUNT_OF(hatInputs)
 
-static_assert(NUM_AXES <= AXIS_COUNT, "At most 8 analog inputs");
+static_assert(COUNT_OF(analogPins) <= AXIS_COUNT, "At most 8 analog inputs");
 static_assert(NUM_HAT == 0 || NUM_HAT == 4, "HAT_INPUTS needs exactly 4 inputs: up, right, down, left");
+
+#if MCP3208_ENABLED
+#define MCP_AXES MCP3208_CHANNELS
+static_assert(MCP3208_CHANNELS >= 1 && MCP3208_CHANNELS <= 8, "MCP3208_CHANNELS must be 1-8");
+#else
+#define MCP_AXES 0
+#endif
+
+#if SHIFT_REG_ENABLED
+#define SR_INPUTS (SHIFT_REG_CHIPS * 8)
+static_assert(SHIFT_REG_CHIPS >= 1 && SHIFT_REG_CHIPS <= 4, "SHIFT_REG_CHIPS must be 1-4");
+#else
+#define SR_INPUTS 0
+#endif
+
+// Inputs: shift register bits first, then the board's own digital pins, then
+// any analog pins left over once all 8 axes are taken.
+#define MAX_INPUTS (SR_INPUTS + COUNT_OF(digitalPins) + COUNT_OF(analogPins))
 
 static const uint8_t reportDescriptor[] PROGMEM = {
   0x05, 0x01,        // Usage Page (Generic Desktop)
@@ -72,30 +92,80 @@ static const uint8_t reportDescriptor[] PROGMEM = {
   0xC0               // End Collection
 };
 
-// What each digital input currently does.
+// What each input currently does.
 enum { ROLE_BUTTON, ROLE_ENCODER, ROLE_HAT };
 
-static uint8_t inputRole[NUM_INPUTS + 1];  // +1 keeps the arrays non-empty
-static Debounce inputs[NUM_INPUTS + 1];
+static uint8_t inputPin[MAX_INPUTS + 1];  // Arduino pin for inputs >= SR_INPUTS
+static uint8_t numInputs;
+static uint8_t axisPin[AXIS_COUNT];       // Arduino pin for axes >= MCP_AXES
+static uint8_t numAxes;
+static bool encodersOnShiftRegs;
+
+static uint8_t inputRole[MAX_INPUTS + 1];
+static Debounce inputs[MAX_INPUTS + 1];
 static Encoder encoders[NUM_ENCODERS + 1];
-static uint16_t axisFiltered[NUM_AXES + 1];  // value << 4 for sub-count precision
+static uint16_t axisFiltered[AXIS_COUNT];  // value << 4 for sub-count precision
 static JoystickReport report, lastReport;
 
 static inline bool validInput(uint8_t n) {
-  return n >= 1 && n <= NUM_INPUTS;
+  return n >= 1 && n <= numInputs;
 }
 
 static inline bool isLow(uint8_t pin) {
   return digitalRead(pin) == LOW;
 }
 
+// ---- 74HC165 shift registers ------------------------------------------------
+
+#if SHIFT_REG_ENABLED
+static uint32_t srBits;  // bit n = shift register input n+1 pressed
+
+// Direct port access: digitalRead/Write would make a 32-bit read take ~300 us.
+static volatile uint8_t *srDataIn, *srClkOut, *srLoadOut;
+static uint8_t srDataMask, srClkMask, srLoadMask;
+#endif
+
+static void readShiftRegisters() {
+#if SHIFT_REG_ENABLED
+  // The port writes below are read-modify-write; keep the USB interrupt (which
+  // blinks the RX/TX LEDs) from changing the same port halfway through.
+  uint8_t sreg = SREG;
+  cli();
+
+  // Pulse SH/LD low to latch all inputs; chip 1's H is then on QH.
+  *srLoadOut &= ~srLoadMask;
+  delayMicroseconds(1);
+  *srLoadOut |= srLoadMask;
+
+  uint32_t bits = 0;
+  for (uint8_t chip = 0; chip < SHIFT_REG_CHIPS; chip++) {
+    for (int8_t bit = 7; bit >= 0; bit--) {  // H first, A last
+      if (!(*srDataIn & srDataMask)) bits |= 1UL << (chip * 8 + bit);
+      *srClkOut |= srClkMask;
+      *srClkOut &= ~srClkMask;
+    }
+  }
+  SREG = sreg;
+  srBits = bits;
+#endif
+}
+
+// Raw (undebounced) state of input index i (0-based).
+static inline bool readInput(uint8_t i) {
+#if SHIFT_REG_ENABLED
+  if (i < SR_INPUTS) return (srBits >> i) & 1;
+#endif
+  return isLow(inputPin[i]);
+}
+
 // ---- Debounced inputs -------------------------------------------------------
 
 // Called once per millisecond.
 static void scanInputs() {
-  for (size_t i = 0; i < NUM_INPUTS; i++) {
+  readShiftRegisters();
+  for (uint8_t i = 0; i < numInputs; i++) {
     Debounce &d = inputs[i];
-    bool raw = isLow(digitalPins[i]);
+    bool raw = readInput(i);
     if (raw == d.pressed) {
       d.count = 0;
     } else if (++d.count >= DEBOUNCE_MS) {
@@ -128,12 +198,13 @@ static inline bool encoderOk(size_t i) {
 }
 
 static uint8_t readEncoderAB(size_t i) {
-  return (isLow(digitalPins[encoderCfg[i].a - 1]) << 1) | isLow(digitalPins[encoderCfg[i].b - 1]);
+  return (readInput(encoderCfg[i].a - 1) << 1) | readInput(encoderCfg[i].b - 1);
 }
 
 // Called as often as possible so fast spins aren't missed.
 static void pollEncoders() {
   static const int8_t qdec[16] = { 0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0 };
+  if (encodersOnShiftRegs) readShiftRegisters();
   for (size_t i = 0; i < NUM_ENCODERS; i++) {
     if (!encoderOk(i)) continue;
     Encoder &e = encoders[i];
@@ -177,9 +248,32 @@ static void tickEncoders() {
 
 // ---- Analog axes ------------------------------------------------------------
 
-static uint16_t readAxis(size_t i) {
-  uint16_t sample = (uint16_t)analogRead(analogPins[i]) << 6;  // 10-bit -> 12-bit, << 4
+#if MCP3208_ENABLED
+static uint16_t readMCP3208(uint8_t ch) {
+  // Start bit, single-ended, then the channel number; 12 result bits follow.
+  SPI.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE0));  // 2 MHz at 5 V
+  digitalWrite(MCP3208_CS_PIN, LOW);
+  SPI.transfer(0x06 | (ch >> 2));
+  uint8_t hi = SPI.transfer((ch & 3) << 6);
+  uint8_t lo = SPI.transfer(0);
+  digitalWrite(MCP3208_CS_PIN, HIGH);
+  SPI.endTransaction();
+  return ((hi & 0x0F) << 8) | lo;
+}
+#endif
+
+// Raw 12-bit sample for axis slot i.
+static uint16_t sampleAxis(uint8_t i) {
+#if MCP3208_ENABLED
+  if (i < MCP_AXES) return readMCP3208(i);
+#endif
+  uint16_t v = analogRead(axisPin[i]) << 2;  // 10-bit -> 12-bit
   pollEncoders();  // each analogRead takes ~100 us
+  return v;
+}
+
+static uint16_t readAxis(uint8_t i) {
+  uint16_t sample = sampleAxis(i) << 4;
 
   if (axisFiltered[i] == 0) axisFiltered[i] = sample;
   axisFiltered[i] += ((int32_t)sample - (int32_t)axisFiltered[i]) >> AXIS_SMOOTHING;
@@ -195,14 +289,14 @@ static uint16_t readAxis(size_t i) {
 // ---- Report -----------------------------------------------------------------
 
 static void buildReport(JoystickReport &r) {
-  for (size_t a = 0; a < AXIS_COUNT; a++)
-    r.axis[a] = a < NUM_AXES ? readAxis(a) : AXIS_CENTER;
+  for (uint8_t a = 0; a < AXIS_COUNT; a++)
+    r.axis[a] = a < numAxes ? readAxis(a) : AXIS_CENTER;
 
   r.hat = readHat();
 
   // Input N is button N, exactly like the BU0836X.
   uint32_t buttons = 0;
-  for (size_t i = 0; i < NUM_INPUTS && i < BUTTON_COUNT; i++)
+  for (uint8_t i = 0; i < numInputs && i < BUTTON_COUNT; i++)
     if (inputRole[i] == ROLE_BUTTON && inputs[i].pressed) buttons |= 1UL << i;
   for (size_t i = 0; i < NUM_ENCODERS; i++) {
     const Encoder &e = encoders[i];
@@ -213,13 +307,63 @@ static void buildReport(JoystickReport &r) {
   r.buttons = buttons;
 }
 
-// ---- Arduino entry points ---------------------------------------------------
+// ---- Setup ------------------------------------------------------------------
+
+// Pins taken by the expansion chips, so they aren't used as inputs.
+static const uint8_t reservedPins[] = {
+#if MCP3208_ENABLED
+  MISO, SCK, MOSI, MCP3208_CS_PIN,
+#endif
+#if SHIFT_REG_ENABLED
+  SHIFT_REG_DATA_PIN, SHIFT_REG_CLK_PIN, SHIFT_REG_LOAD_PIN,
+#endif
+};
+
+static bool isReserved(uint8_t pin) {
+  for (size_t i = 0; i < COUNT_OF(reservedPins); i++)
+    if (reservedPins[i] == pin) return true;
+  return false;
+}
+
+static void addInputPin(uint8_t pin) {
+  pinMode(pin, INPUT_PULLUP);
+  inputPin[numInputs++] = pin;
+}
 
 void setup() {
   static HIDSubDescriptor node(reportDescriptor, sizeof(reportDescriptor));
   HID().AppendDescriptor(&node);
 
-  for (size_t i = 0; i < NUM_INPUTS; i++) pinMode(digitalPins[i], INPUT_PULLUP);
+#if SHIFT_REG_ENABLED
+  pinMode(SHIFT_REG_DATA_PIN, INPUT);
+  pinMode(SHIFT_REG_CLK_PIN, OUTPUT);
+  digitalWrite(SHIFT_REG_CLK_PIN, LOW);
+  pinMode(SHIFT_REG_LOAD_PIN, OUTPUT);
+  digitalWrite(SHIFT_REG_LOAD_PIN, HIGH);
+  srDataIn = portInputRegister(digitalPinToPort(SHIFT_REG_DATA_PIN));
+  srDataMask = digitalPinToBitMask(SHIFT_REG_DATA_PIN);
+  srClkOut = portOutputRegister(digitalPinToPort(SHIFT_REG_CLK_PIN));
+  srClkMask = digitalPinToBitMask(SHIFT_REG_CLK_PIN);
+  srLoadOut = portOutputRegister(digitalPinToPort(SHIFT_REG_LOAD_PIN));
+  srLoadMask = digitalPinToBitMask(SHIFT_REG_LOAD_PIN);
+#endif
+#if MCP3208_ENABLED
+  pinMode(MCP3208_CS_PIN, OUTPUT);
+  digitalWrite(MCP3208_CS_PIN, HIGH);
+  SPI.begin();
+#endif
+
+  numInputs = SR_INPUTS;
+  numAxes = MCP_AXES;
+  for (size_t i = 0; i < COUNT_OF(digitalPins); i++)
+    if (!isReserved(digitalPins[i])) addInputPin(digitalPins[i]);
+  for (size_t i = 0; i < COUNT_OF(analogPins); i++) {
+    uint8_t pin = analogPins[i];
+    if (isReserved(pin)) continue;
+    if (numAxes < AXIS_COUNT) axisPin[numAxes++] = pin;
+    else addInputPin(pin);  // no axis slot left: use it as a button
+  }
+
   for (size_t i = 0; i < NUM_HAT; i++)
     if (validInput(hatInputs[i])) inputRole[hatInputs[i] - 1] = ROLE_HAT;
   for (size_t i = 0; i < NUM_ENCODERS; i++) {
@@ -227,8 +371,10 @@ void setup() {
     if (!encoderOk(i)) continue;
     inputRole[encoderCfg[i].a - 1] = ROLE_ENCODER;
     inputRole[encoderCfg[i].b - 1] = ROLE_ENCODER;
+    if (encoderCfg[i].a <= SR_INPUTS || encoderCfg[i].b <= SR_INPUTS) encodersOnShiftRegs = true;
   }
   delayMicroseconds(100);  // let pull-ups settle
+  readShiftRegisters();
   for (size_t i = 0; i < NUM_ENCODERS; i++)
     if (encoderOk(i)) encoders[i].prev = readEncoderAB(i);
 

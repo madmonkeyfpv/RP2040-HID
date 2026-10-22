@@ -30,6 +30,15 @@ jobs:
           git clone --depth 1 --branch 2.1.1 https://github.com/raspberrypi/pico-sdk.git "$RUNNER_TEMP/pico-sdk"
           git -C "$RUNNER_TEMP/pico-sdk" submodule update --init --depth 1 lib/tinyusb
 
+      - name: Check build with MCP3208 + 74HC165 enabled
+        env:
+          PICO_SDK_PATH: ${{ runner.temp }}/pico-sdk
+        run: |
+          cp -r rp2040 "$RUNNER_TEMP/rp2040-expansion"
+          sed -i 's/^#define MCP3208_ENABLED .*/#define MCP3208_ENABLED 1/; s/^#define SHIFT_REG_ENABLED .*/#define SHIFT_REG_ENABLED 1/' "$RUNNER_TEMP/rp2040-expansion/src/config.h"
+          cmake -S "$RUNNER_TEMP/rp2040-expansion" -B build-expansion -DPICO_BOARD=${{ matrix.board }}
+          cmake --build build-expansion -j
+
       - name: Build
         env:
           PICO_SDK_PATH: ${{ runner.temp }}/pico-sdk
@@ -51,10 +60,17 @@ jobs:
         fqbn: ["arduino:avr:leonardo", "arduino:avr:micro"]
     steps:
       - uses: actions/checkout@v4
+      - name: Make a copy with MCP3208 + 74HC165 enabled
+        run: |
+          mkdir -p ci && cp -r arduino/HIDJoystick ci/HIDJoystickExpansion
+          mv ci/HIDJoystickExpansion/HIDJoystick.ino ci/HIDJoystickExpansion/HIDJoystickExpansion.ino
+          sed -i 's/^#define MCP3208_ENABLED .*/#define MCP3208_ENABLED 1/; s/^#define SHIFT_REG_ENABLED .*/#define SHIFT_REG_ENABLED 1/' ci/HIDJoystickExpansion/config.h
       - uses: arduino/compile-sketches@v1
         with:
           fqbn: ${{ matrix.fqbn }}
-          sketch-paths: arduino/HIDJoystick
+          sketch-paths: |
+            - arduino/HIDJoystick
+            - ci/HIDJoystickExpansion
 
   release:
     name: Publish release

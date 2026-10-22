@@ -19,6 +19,7 @@ target_link_libraries(rp2040_hid PRIVATE
     pico_stdlib
     pico_unique_id
     hardware_adc
+    hardware_spi
     tinyusb_device
 )
 
