@@ -34,9 +34,18 @@ below.
 
 ### 1. Get the firmware
 
-**Easiest:** on GitHub, open **Actions → Build firmware**, pick the latest run and download
-the `.uf2` for your board (`pico`, `pico2` or `waveshare_rp2040_zero`). Tagged releases
-(`v*`) also attach the `.uf2` files to a GitHub Release.
+**Easiest:** download the `.uf2` for your board from the latest
+[GitHub Release](https://github.com/madmonkeyfpv/RP2040-HID/releases/latest), or from
+**Actions → Build firmware** (latest run). Each board has two files:
+
+| File | Use when |
+|---|---|
+| `rp2040_hid-<board>.uf2` | only the board's own pins are wired |
+| `rp2040_hid-<board>-expansion.uf2` | an MCP3208 and 74HC165s are fitted on the default pins (see [Expansion](#expansion-full-bu0836x-count)) |
+
+`<board>` is `pico` (Pico, Pico W), `pico2` (Pico 2, Pico 2 W) or `waveshare_rp2040_zero`.
+Use the plain file if you only fit one of the two chips, or if you move their pins, and
+build your own with `config.h` edited.
 
 **Or build it yourself:**
 
