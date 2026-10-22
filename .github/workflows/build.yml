@@ -1,0 +1,70 @@
+name: Build firmware
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  rp2040:
+    name: RP2040 / RP2350 (${{ matrix.board }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        board: [pico, pico2]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib cmake
+
+      - name: Fetch Pico SDK
+        run: |
+          git clone --depth 1 --branch 2.1.1 https://github.com/raspberrypi/pico-sdk.git "$RUNNER_TEMP/pico-sdk"
+          git -C "$RUNNER_TEMP/pico-sdk" submodule update --init --depth 1 lib/tinyusb
+
+      - name: Build
+        env:
+          PICO_SDK_PATH: ${{ runner.temp }}/pico-sdk
+        run: |
+          cmake -S rp2040 -B build -DPICO_BOARD=${{ matrix.board }} -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j
+          cp build/rp2040_hid.uf2 rp2040_hid-${{ matrix.board }}.uf2
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rp2040_hid-${{ matrix.board }}
+          path: rp2040_hid-${{ matrix.board }}.uf2
+
+  arduino:
+    name: Arduino (${{ matrix.fqbn }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        fqbn: ["arduino:avr:leonardo", "arduino:avr:micro"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/compile-sketches@v1
+        with:
+          fqbn: ${{ matrix.fqbn }}
+          sketch-paths: arduino/HIDJoystick
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [rp2040, arduino]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: "*.uf2"
