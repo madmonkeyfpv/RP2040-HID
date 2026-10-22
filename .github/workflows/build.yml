@@ -30,15 +30,6 @@ jobs:
           git clone --depth 1 --branch 2.1.1 https://github.com/raspberrypi/pico-sdk.git "$RUNNER_TEMP/pico-sdk"
           git -C "$RUNNER_TEMP/pico-sdk" submodule update --init --depth 1 lib/tinyusb
 
-      - name: Check build with MCP3208 + 74HC165 enabled
-        env:
-          PICO_SDK_PATH: ${{ runner.temp }}/pico-sdk
-        run: |
-          cp -r rp2040 "$RUNNER_TEMP/rp2040-expansion"
-          sed -i 's/^#define MCP3208_ENABLED .*/#define MCP3208_ENABLED 1/; s/^#define SHIFT_REG_ENABLED .*/#define SHIFT_REG_ENABLED 1/' "$RUNNER_TEMP/rp2040-expansion/src/config.h"
-          cmake -S "$RUNNER_TEMP/rp2040-expansion" -B build-expansion -DPICO_BOARD=${{ matrix.board }}
-          cmake --build build-expansion -j
-
       - name: Build
         env:
           PICO_SDK_PATH: ${{ runner.temp }}/pico-sdk
@@ -47,10 +38,24 @@ jobs:
           cmake --build build -j
           cp build/rp2040_hid.uf2 rp2040_hid-${{ matrix.board }}.uf2
 
+      - name: Build with MCP3208 + 74HC165 enabled
+        env:
+          PICO_SDK_PATH: ${{ runner.temp }}/pico-sdk
+        run: |
+          cp -r rp2040 "$RUNNER_TEMP/rp2040-expansion"
+          sed -i 's/^#define MCP3208_ENABLED .*/#define MCP3208_ENABLED 1/; s/^#define SHIFT_REG_ENABLED .*/#define SHIFT_REG_ENABLED 1/' "$RUNNER_TEMP/rp2040-expansion/src/config.h"
+          grep -q '^#define MCP3208_ENABLED 1' "$RUNNER_TEMP/rp2040-expansion/src/config.h"
+          grep -q '^#define SHIFT_REG_ENABLED 1' "$RUNNER_TEMP/rp2040-expansion/src/config.h"
+          cmake -S "$RUNNER_TEMP/rp2040-expansion" -B build-expansion -DPICO_BOARD=${{ matrix.board }} -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-expansion -j
+          cp build-expansion/rp2040_hid.uf2 rp2040_hid-${{ matrix.board }}-expansion.uf2
+
       - uses: actions/upload-artifact@v4
         with:
           name: rp2040_hid-${{ matrix.board }}
-          path: rp2040_hid-${{ matrix.board }}.uf2
+          path: |
+            rp2040_hid-${{ matrix.board }}.uf2
+            rp2040_hid-${{ matrix.board }}-expansion.uf2
 
   arduino:
     name: Arduino (${{ matrix.fqbn }})
