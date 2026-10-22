@@ -1,5 +1,6 @@
-// RP2040-HID: turns an RP2040 board into a native USB HID joystick, in the
-// spirit of the Leo Bodnar BU0836 boards. Configure pins in config.h.
+// RP2040-HID: turns an RP2040 board into a native USB HID joystick that
+// behaves like a Leo Bodnar BU0836X. Every ADC pin is an axis, every other
+// usable pin is a button. See config.h.
 
 #include <stdbool.h>
 #include <string.h>
@@ -13,76 +14,58 @@
 
 #define COUNT_OF(a) (sizeof(a) / sizeof((a)[0]))
 
-typedef struct { uint8_t gpio; uint8_t axis; bool inverted; } axis_cfg_t;
 typedef struct { uint8_t a, b; } encoder_cfg_t;
 
-static const uint8_t direct_pins[] = DIRECT_BUTTON_PINS;
-static const uint8_t row_pins[] = MATRIX_ROW_PINS;
-static const uint8_t col_pins[] = MATRIX_COL_PINS;
-static const encoder_cfg_t encoder_pins[] = ENCODER_PINS;
-static const axis_cfg_t axis_cfg[] = ANALOG_AXES;
-#ifdef HAT_PINS
-static const uint8_t hat_pins[] = HAT_PINS;
+static const uint8_t digital_pins[] = DIGITAL_INPUT_PINS;
+static const uint8_t analog_pins[] = ANALOG_INPUT_PINS;
+static const encoder_cfg_t encoder_cfg[] = ENCODER_INPUTS;
+#ifdef HAT_INPUTS
+static const uint8_t hat_inputs[] = HAT_INPUTS;
 #else
-static const uint8_t hat_pins[] = {};
+static const uint8_t hat_inputs[] = {};
 #endif
 
-#define NUM_DIRECT   COUNT_OF(direct_pins)
-#define NUM_MATRIX   (COUNT_OF(row_pins) * COUNT_OF(col_pins))
-#define NUM_HAT      COUNT_OF(hat_pins)
-#define NUM_SWITCHES (NUM_DIRECT + NUM_MATRIX + NUM_HAT)
-#define NUM_ENCODERS COUNT_OF(encoder_pins)
-#define NUM_AXES     COUNT_OF(axis_cfg)
+#define NUM_INPUTS   COUNT_OF(digital_pins)
+#define NUM_AXES     COUNT_OF(analog_pins)
+#define NUM_ENCODERS COUNT_OF(encoder_cfg)
+#define NUM_HAT      COUNT_OF(hat_inputs)
 
-_Static_assert(NUM_HAT == 0 || NUM_HAT == 4, "HAT_PINS needs exactly 4 pins: up, right, down, left");
+_Static_assert(NUM_AXES <= AXIS_COUNT, "At most 8 analog inputs");
+_Static_assert(NUM_HAT == 0 || NUM_HAT == 4, "HAT_INPUTS needs exactly 4 inputs: up, right, down, left");
 
-// ---- Debounced switches -----------------------------------------------------
+// What each digital input currently does.
+enum { ROLE_BUTTON, ROLE_ENCODER, ROLE_HAT };
+static uint8_t input_role[NUM_INPUTS + 1];  // +1 keeps the array non-empty
 
-typedef struct {
-    bool    pressed;
-    uint8_t count;
-} debounce_t;
-
-static debounce_t switches[NUM_SWITCHES + 1];  // +1 keeps the array non-empty
-
-static void debounce(debounce_t *d, bool raw) {
-    if (raw == d->pressed) {
-        d->count = 0;
-    } else if (++d->count >= DEBOUNCE_MS) {
-        d->pressed = raw;
-        d->count = 0;
-    }
-}
-
-static void init_input(uint gpio) {
-    gpio_init(gpio);
-    gpio_set_dir(gpio, GPIO_IN);
-    gpio_pull_up(gpio);
+static inline bool valid_input(uint8_t n) {
+    return n >= 1 && n <= NUM_INPUTS;
 }
 
 static inline bool is_low(uint gpio) {
     return !gpio_get(gpio);
 }
 
+// ---- Debounced inputs -------------------------------------------------------
+
+typedef struct {
+    bool    pressed;
+    uint8_t count;
+} debounce_t;
+
+static debounce_t inputs[NUM_INPUTS + 1];
+
 // Called once per millisecond.
-static void scan_switches(void) {
-    size_t s = 0;
-
-    for (size_t i = 0; i < NUM_DIRECT; i++)
-        debounce(&switches[s++], is_low(direct_pins[i]));
-
-    for (size_t r = 0; r < COUNT_OF(row_pins); r++) {
-        // Drive one row low at a time; idle rows float so they can't fight.
-        gpio_set_dir(row_pins[r], GPIO_OUT);
-        gpio_put(row_pins[r], 0);
-        busy_wait_us_32(5);
-        for (size_t c = 0; c < COUNT_OF(col_pins); c++)
-            debounce(&switches[s++], is_low(col_pins[c]));
-        gpio_set_dir(row_pins[r], GPIO_IN);
+static void scan_inputs(void) {
+    for (size_t i = 0; i < NUM_INPUTS; i++) {
+        debounce_t *d = &inputs[i];
+        bool raw = is_low(digital_pins[i]);
+        if (raw == d->pressed) {
+            d->count = 0;
+        } else if (++d->count >= DEBOUNCE_MS) {
+            d->pressed = raw;
+            d->count = 0;
+        }
     }
-
-    for (size_t i = 0; i < NUM_HAT; i++)
-        debounce(&switches[s++], is_low(hat_pins[i]));
 }
 
 // ---- Hat switch -------------------------------------------------------------
@@ -95,9 +78,9 @@ static uint8_t read_hat(void) {
         HAT_CENTERED, 0, 2, 1, 4, HAT_CENTERED, 3, 2,
         6, 7, HAT_CENTERED, 0, 5, 6, 4, HAT_CENTERED,
     };
-    const debounce_t *h = &switches[NUM_DIRECT + NUM_MATRIX];
-    uint8_t idx = (h[0].pressed << 0) | (h[1].pressed << 1) |
-                  (h[2].pressed << 2) | (h[3].pressed << 3);
+    uint8_t idx = 0;
+    for (size_t i = 0; i < NUM_HAT; i++)
+        if (valid_input(hat_inputs[i]) && inputs[hat_inputs[i] - 1].pressed) idx |= 1u << i;
     return lut[idx];
 }
 
@@ -106,7 +89,7 @@ static uint8_t read_hat(void) {
 typedef struct {
     uint8_t  prev;        // last AB state
     int8_t   steps;       // quadrature steps since last detent
-    uint8_t  pending[2];  // queued detents: [0] = CCW, [1] = CW
+    uint8_t  pending[2];  // queued detents: [0] = towards A, [1] = towards B
     int8_t   active;      // direction currently being pulsed, -1 = none
     uint16_t timer_ms;    // time left in current pulse phase
     bool     released;    // true during the gap after a pulse
@@ -114,14 +97,20 @@ typedef struct {
 
 static encoder_t encoders[NUM_ENCODERS + 1];
 
+static inline bool encoder_ok(size_t i) {
+    return valid_input(encoder_cfg[i].a) && valid_input(encoder_cfg[i].b);
+}
+
 static uint8_t read_encoder_ab(size_t i) {
-    return (uint8_t)((is_low(encoder_pins[i].a) << 1) | is_low(encoder_pins[i].b));
+    return (uint8_t)((is_low(digital_pins[encoder_cfg[i].a - 1]) << 1) |
+                     is_low(digital_pins[encoder_cfg[i].b - 1]));
 }
 
 // Called as often as possible so fast spins aren't missed.
 static void poll_encoders(void) {
     static const int8_t qdec[16] = { 0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0 };
     for (size_t i = 0; i < NUM_ENCODERS; i++) {
+        if (!encoder_ok(i)) continue;
         encoder_t *e = &encoders[i];
         uint8_t ab = read_encoder_ab(i);
         if (ab == e->prev) continue;
@@ -166,7 +155,7 @@ static void tick_encoders(void) {
 static uint32_t axis_filtered[NUM_AXES + 1];  // value << 8 for sub-count precision
 
 static uint16_t read_axis(size_t i) {
-    adc_select_input(axis_cfg[i].gpio - ADC_BASE_PIN);
+    adc_select_input(analog_pins[i] - ADC_BASE_PIN);
     uint32_t sum = 0;
     for (int n = 0; n < 16; n++) sum += adc_read();
     uint32_t sample = (sum / 16) << 8;
@@ -179,25 +168,26 @@ static uint16_t read_axis(size_t i) {
     v = (v - AXIS_DEADZONE_EDGE) * AXIS_MAX / (AXIS_MAX - 2 * AXIS_DEADZONE_EDGE);
     if (v < 0) v = 0;
     if (v > AXIS_MAX) v = AXIS_MAX;
-    return (uint16_t)(axis_cfg[i].inverted ? AXIS_MAX - v : v);
+    return (uint16_t)((AXIS_INVERT >> i) & 1 ? AXIS_MAX - v : v);
 }
 
 // ---- Report -----------------------------------------------------------------
 
 static void build_report(joystick_report_t *r) {
-    for (int a = 0; a < AXIS_COUNT; a++) r->axis[a] = AXIS_CENTER;
-    for (size_t i = 0; i < NUM_AXES; i++) r->axis[axis_cfg[i].axis] = read_axis(i);
+    for (size_t a = 0; a < AXIS_COUNT; a++)
+        r->axis[a] = a < NUM_AXES ? read_axis(a) : AXIS_CENTER;
 
     r->hat = read_hat();
 
+    // Input N is button N, exactly like the BU0836X.
     uint32_t buttons = 0;
-    unsigned b = 0;
-    for (size_t i = 0; i < NUM_DIRECT + NUM_MATRIX; i++, b++)
-        if (switches[i].pressed && b < BUTTON_COUNT) buttons |= 1u << b;
-    for (size_t i = 0; i < NUM_ENCODERS; i++, b += 2) {
+    for (size_t i = 0; i < NUM_INPUTS && i < BUTTON_COUNT; i++)
+        if (input_role[i] == ROLE_BUTTON && inputs[i].pressed) buttons |= 1u << i;
+    for (size_t i = 0; i < NUM_ENCODERS; i++) {
         const encoder_t *e = &encoders[i];
-        if (e->active >= 0 && !e->released && b + e->active < BUTTON_COUNT)
-            buttons |= 1u << (b + e->active);
+        if (!encoder_ok(i) || e->active < 0 || e->released) continue;
+        uint8_t n = e->active ? encoder_cfg[i].b : encoder_cfg[i].a;
+        if (n <= BUTTON_COUNT) buttons |= 1u << (n - 1);
     }
     r->buttons = buttons;
 }
@@ -219,35 +209,53 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_
     (void)instance; (void)report_id; (void)report_type; (void)buffer; (void)bufsize;
 }
 
+// ---- Status LED -------------------------------------------------------------
+
+#if STATUS_LED && defined(PICO_DEFAULT_LED_PIN)
+static bool led_available(void) {
+    for (size_t i = 0; i < NUM_INPUTS; i++)
+        if (digital_pins[i] == PICO_DEFAULT_LED_PIN) return false;
+    return true;
+}
+#endif
+
 // ---- Main -------------------------------------------------------------------
 
 static void init_hardware(void) {
-    for (size_t i = 0; i < NUM_DIRECT; i++) init_input(direct_pins[i]);
-    for (size_t i = 0; i < COUNT_OF(row_pins); i++) init_input(row_pins[i]);
-    for (size_t i = 0; i < COUNT_OF(col_pins); i++) init_input(col_pins[i]);
-    for (size_t i = 0; i < NUM_HAT; i++) init_input(hat_pins[i]);
+    for (size_t i = 0; i < NUM_INPUTS; i++) {
+        gpio_init(digital_pins[i]);
+        gpio_set_dir(digital_pins[i], GPIO_IN);
+        gpio_pull_up(digital_pins[i]);
+    }
+    for (size_t i = 0; i < NUM_HAT; i++)
+        if (valid_input(hat_inputs[i])) input_role[hat_inputs[i] - 1] = ROLE_HAT;
     for (size_t i = 0; i < NUM_ENCODERS; i++) {
-        init_input(encoder_pins[i].a);
-        init_input(encoder_pins[i].b);
         encoders[i].active = -1;
+        if (!encoder_ok(i)) continue;
+        input_role[encoder_cfg[i].a - 1] = ROLE_ENCODER;
+        input_role[encoder_cfg[i].b - 1] = ROLE_ENCODER;
     }
     busy_wait_us_32(100);  // let pull-ups settle
-    for (size_t i = 0; i < NUM_ENCODERS; i++) encoders[i].prev = read_encoder_ab(i);
+    for (size_t i = 0; i < NUM_ENCODERS; i++)
+        if (encoder_ok(i)) encoders[i].prev = read_encoder_ab(i);
 
     if (NUM_AXES) {
         adc_init();
-        for (size_t i = 0; i < NUM_AXES; i++) adc_gpio_init(axis_cfg[i].gpio);
+        for (size_t i = 0; i < NUM_AXES; i++) adc_gpio_init(analog_pins[i]);
     }
-
-#if STATUS_LED && defined(PICO_DEFAULT_LED_PIN)
-    gpio_init(PICO_DEFAULT_LED_PIN);
-    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
-#endif
 }
 
 int main(void) {
     init_hardware();
     tusb_init();
+
+#if STATUS_LED && defined(PICO_DEFAULT_LED_PIN)
+    bool use_led = led_available();
+    if (use_led) {
+        gpio_init(PICO_DEFAULT_LED_PIN);
+        gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
+    }
+#endif
 
     joystick_report_t last;
     memset(&last, 0xFF, sizeof(last));
@@ -262,12 +270,12 @@ int main(void) {
         next_tick += 1000;
         if (now > next_tick + 10000) next_tick = now;  // don't try to catch up after a stall
 
-        scan_switches();
+        scan_inputs();
         tick_encoders();
         build_report(&report);
 
 #if STATUS_LED && defined(PICO_DEFAULT_LED_PIN)
-        gpio_put(PICO_DEFAULT_LED_PIN, tud_mounted());
+        if (use_led) gpio_put(PICO_DEFAULT_LED_PIN, tud_mounted());
 #endif
 
         if (tud_suspended()) {

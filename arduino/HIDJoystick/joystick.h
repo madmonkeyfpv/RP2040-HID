@@ -21,8 +21,7 @@ enum {
 #define HAT_CENTERED  8
 #define REPORT_ID     3
 
-struct AxisConfig { uint8_t pin; uint8_t axis; bool inverted; };
-struct EncoderConfig { uint8_t a, b; };
+struct EncoderConfig { uint8_t a, b; };  // input numbers, 1-based
 
 struct Debounce {
   bool pressed;
@@ -32,13 +31,13 @@ struct Debounce {
 struct Encoder {
   uint8_t prev;        // last AB state
   int8_t steps;        // quadrature steps since last detent
-  uint8_t pending[2];  // queued detents: [0] = CCW, [1] = CW
+  uint8_t pending[2];  // queued detents: [0] = towards A, [1] = towards B
   int8_t active;       // direction currently being pulsed, -1 = none
   uint16_t timerMs;    // time left in current pulse phase
   bool released;       // true during the gap after a pulse
 };
 
-// Same layout as the RP2040 firmware and a Leo Bodnar BU0836A: 8 x 12-bit
+// Same layout as the RP2040 firmware and a Leo Bodnar BU0836X: 8 x 12-bit
 // axes, one 8-way hat and 32 buttons.
 struct __attribute__((packed)) JoystickReport {
   uint16_t axis[AXIS_COUNT];  // 0..AXIS_MAX

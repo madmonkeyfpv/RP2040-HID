@@ -20,7 +20,7 @@ enum {
 #define BUTTON_COUNT    32
 #define HAT_CENTERED    8
 
-// Same layout as a Leo Bodnar BU0836A: 8 x 12-bit axes, one 8-way hat and
+// Same layout as a Leo Bodnar BU0836X: 8 x 12-bit axes, one 8-way hat and
 // 32 buttons. The descriptor is fixed so Windows never sees it change.
 typedef struct __attribute__((packed)) {
     uint16_t axis[AXIS_COUNT];  // 0..AXIS_MAX

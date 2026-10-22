@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        board: [pico, pico2]
+        board: [pico, pico2, waveshare_rp2040_zero]
     steps:
       - uses: actions/checkout@v4
 

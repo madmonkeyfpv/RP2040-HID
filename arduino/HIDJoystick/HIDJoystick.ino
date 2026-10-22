@@ -1,7 +1,8 @@
 // HIDJoystick: turns an ATmega32U4 Arduino (Leonardo, Micro, Pro Micro) into a
-// native USB HID joystick, in the spirit of the Leo Bodnar BU0836 boards.
-// Configure pins in config.h. Uses only the HID library built into the
-// Arduino AVR core, so there is nothing extra to install.
+// native USB HID joystick that behaves like a Leo Bodnar BU0836X: every analog
+// pin is an axis, every other usable pin is a button. See config.h. Uses only
+// the HID library built into the Arduino AVR core, so there is nothing extra to
+// install.
 
 #if !defined(USBCON)
 #error "This sketch needs a board with native USB (ATmega32U4: Leonardo, Micro, Pro Micro). An Uno/Nano cannot act as a USB joystick."
@@ -14,25 +15,22 @@
 
 #define COUNT_OF(a) (sizeof(a) / sizeof((a)[0]))
 
-static const uint8_t directPins[] = DIRECT_BUTTON_PINS;
-static const uint8_t rowPins[] = MATRIX_ROW_PINS;
-static const uint8_t colPins[] = MATRIX_COL_PINS;
-static const EncoderConfig encoderPins[] = ENCODER_PINS;
-static const AxisConfig axisCfg[] = ANALOG_AXES;
-#ifdef HAT_PINS
-static const uint8_t hatPins[] = HAT_PINS;
+static const uint8_t digitalPins[] = DIGITAL_INPUT_PINS;
+static const uint8_t analogPins[] = ANALOG_INPUT_PINS;
+static const EncoderConfig encoderCfg[] = ENCODER_INPUTS;
+#ifdef HAT_INPUTS
+static const uint8_t hatInputs[] = HAT_INPUTS;
 #else
-static const uint8_t hatPins[] = {};
+static const uint8_t hatInputs[] = {};
 #endif
 
-#define NUM_DIRECT   COUNT_OF(directPins)
-#define NUM_MATRIX   (COUNT_OF(rowPins) * COUNT_OF(colPins))
-#define NUM_HAT      COUNT_OF(hatPins)
-#define NUM_SWITCHES (NUM_DIRECT + NUM_MATRIX + NUM_HAT)
-#define NUM_ENCODERS COUNT_OF(encoderPins)
-#define NUM_AXES     COUNT_OF(axisCfg)
+#define NUM_INPUTS   COUNT_OF(digitalPins)
+#define NUM_AXES     COUNT_OF(analogPins)
+#define NUM_ENCODERS COUNT_OF(encoderCfg)
+#define NUM_HAT      COUNT_OF(hatInputs)
 
-static_assert(NUM_HAT == 0 || NUM_HAT == 4, "HAT_PINS needs exactly 4 pins: up, right, down, left");
+static_assert(NUM_AXES <= AXIS_COUNT, "At most 8 analog inputs");
+static_assert(NUM_HAT == 0 || NUM_HAT == 4, "HAT_INPUTS needs exactly 4 inputs: up, right, down, left");
 
 static const uint8_t reportDescriptor[] PROGMEM = {
   0x05, 0x01,        // Usage Page (Generic Desktop)
@@ -74,45 +72,37 @@ static const uint8_t reportDescriptor[] PROGMEM = {
   0xC0               // End Collection
 };
 
-static Debounce switches[NUM_SWITCHES + 1];  // +1 keeps the array non-empty
+// What each digital input currently does.
+enum { ROLE_BUTTON, ROLE_ENCODER, ROLE_HAT };
+
+static uint8_t inputRole[NUM_INPUTS + 1];  // +1 keeps the arrays non-empty
+static Debounce inputs[NUM_INPUTS + 1];
 static Encoder encoders[NUM_ENCODERS + 1];
 static uint16_t axisFiltered[NUM_AXES + 1];  // value << 4 for sub-count precision
 static JoystickReport report, lastReport;
 
-// ---- Debounced switches -----------------------------------------------------
-
-static void debounce(Debounce &d, bool raw) {
-  if (raw == d.pressed) {
-    d.count = 0;
-  } else if (++d.count >= DEBOUNCE_MS) {
-    d.pressed = raw;
-    d.count = 0;
-  }
+static inline bool validInput(uint8_t n) {
+  return n >= 1 && n <= NUM_INPUTS;
 }
 
 static inline bool isLow(uint8_t pin) {
   return digitalRead(pin) == LOW;
 }
 
+// ---- Debounced inputs -------------------------------------------------------
+
 // Called once per millisecond.
-static void scanSwitches() {
-  size_t s = 0;
-
-  for (size_t i = 0; i < NUM_DIRECT; i++)
-    debounce(switches[s++], isLow(directPins[i]));
-
-  for (size_t r = 0; r < COUNT_OF(rowPins); r++) {
-    // Drive one row low at a time; idle rows float so they can't fight.
-    pinMode(rowPins[r], OUTPUT);
-    digitalWrite(rowPins[r], LOW);
-    delayMicroseconds(5);
-    for (size_t c = 0; c < COUNT_OF(colPins); c++)
-      debounce(switches[s++], isLow(colPins[c]));
-    pinMode(rowPins[r], INPUT_PULLUP);
+static void scanInputs() {
+  for (size_t i = 0; i < NUM_INPUTS; i++) {
+    Debounce &d = inputs[i];
+    bool raw = isLow(digitalPins[i]);
+    if (raw == d.pressed) {
+      d.count = 0;
+    } else if (++d.count >= DEBOUNCE_MS) {
+      d.pressed = raw;
+      d.count = 0;
+    }
   }
-
-  for (size_t i = 0; i < NUM_HAT; i++)
-    debounce(switches[s++], isLow(hatPins[i]));
 }
 
 // ---- Hat switch -------------------------------------------------------------
@@ -125,22 +115,27 @@ static uint8_t readHat() {
     HAT_CENTERED, 0, 2, 1, 4, HAT_CENTERED, 3, 2,
     6, 7, HAT_CENTERED, 0, 5, 6, 4, HAT_CENTERED,
   };
-  const Debounce *h = &switches[NUM_DIRECT + NUM_MATRIX];
-  uint8_t idx = (h[0].pressed << 0) | (h[1].pressed << 1) |
-                (h[2].pressed << 2) | (h[3].pressed << 3);
+  uint8_t idx = 0;
+  for (size_t i = 0; i < NUM_HAT; i++)
+    if (validInput(hatInputs[i]) && inputs[hatInputs[i] - 1].pressed) idx |= 1 << i;
   return lut[idx];
 }
 
 // ---- Rotary encoders --------------------------------------------------------
 
+static inline bool encoderOk(size_t i) {
+  return validInput(encoderCfg[i].a) && validInput(encoderCfg[i].b);
+}
+
 static uint8_t readEncoderAB(size_t i) {
-  return (isLow(encoderPins[i].a) << 1) | isLow(encoderPins[i].b);
+  return (isLow(digitalPins[encoderCfg[i].a - 1]) << 1) | isLow(digitalPins[encoderCfg[i].b - 1]);
 }
 
 // Called as often as possible so fast spins aren't missed.
 static void pollEncoders() {
   static const int8_t qdec[16] = { 0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0 };
   for (size_t i = 0; i < NUM_ENCODERS; i++) {
+    if (!encoderOk(i)) continue;
     Encoder &e = encoders[i];
     uint8_t ab = readEncoderAB(i);
     if (ab == e.prev) continue;
@@ -183,7 +178,7 @@ static void tickEncoders() {
 // ---- Analog axes ------------------------------------------------------------
 
 static uint16_t readAxis(size_t i) {
-  uint16_t sample = (uint16_t)analogRead(axisCfg[i].pin) << 6;  // 10-bit -> 12-bit, << 4
+  uint16_t sample = (uint16_t)analogRead(analogPins[i]) << 6;  // 10-bit -> 12-bit, << 4
   pollEncoders();  // each analogRead takes ~100 us
 
   if (axisFiltered[i] == 0) axisFiltered[i] = sample;
@@ -194,25 +189,26 @@ static uint16_t readAxis(size_t i) {
   v = (v - AXIS_DEADZONE_EDGE) * AXIS_MAX / (AXIS_MAX - 2 * AXIS_DEADZONE_EDGE);
   if (v < 0) v = 0;
   if (v > AXIS_MAX) v = AXIS_MAX;
-  return axisCfg[i].inverted ? AXIS_MAX - v : v;
+  return (AXIS_INVERT >> i) & 1 ? AXIS_MAX - v : v;
 }
 
 // ---- Report -----------------------------------------------------------------
 
 static void buildReport(JoystickReport &r) {
-  for (int a = 0; a < AXIS_COUNT; a++) r.axis[a] = AXIS_CENTER;
-  for (size_t i = 0; i < NUM_AXES; i++) r.axis[axisCfg[i].axis] = readAxis(i);
+  for (size_t a = 0; a < AXIS_COUNT; a++)
+    r.axis[a] = a < NUM_AXES ? readAxis(a) : AXIS_CENTER;
 
   r.hat = readHat();
 
+  // Input N is button N, exactly like the BU0836X.
   uint32_t buttons = 0;
-  unsigned b = 0;
-  for (size_t i = 0; i < NUM_DIRECT + NUM_MATRIX; i++, b++)
-    if (switches[i].pressed && b < BUTTON_COUNT) buttons |= 1UL << b;
-  for (size_t i = 0; i < NUM_ENCODERS; i++, b += 2) {
+  for (size_t i = 0; i < NUM_INPUTS && i < BUTTON_COUNT; i++)
+    if (inputRole[i] == ROLE_BUTTON && inputs[i].pressed) buttons |= 1UL << i;
+  for (size_t i = 0; i < NUM_ENCODERS; i++) {
     const Encoder &e = encoders[i];
-    if (e.active >= 0 && !e.released && b + e.active < BUTTON_COUNT)
-      buttons |= 1UL << (b + e.active);
+    if (!encoderOk(i) || e.active < 0 || e.released) continue;
+    uint8_t n = e.active ? encoderCfg[i].b : encoderCfg[i].a;
+    if (n <= BUTTON_COUNT) buttons |= 1UL << (n - 1);
   }
   r.buttons = buttons;
 }
@@ -223,17 +219,18 @@ void setup() {
   static HIDSubDescriptor node(reportDescriptor, sizeof(reportDescriptor));
   HID().AppendDescriptor(&node);
 
-  for (size_t i = 0; i < NUM_DIRECT; i++) pinMode(directPins[i], INPUT_PULLUP);
-  for (size_t i = 0; i < COUNT_OF(rowPins); i++) pinMode(rowPins[i], INPUT_PULLUP);
-  for (size_t i = 0; i < COUNT_OF(colPins); i++) pinMode(colPins[i], INPUT_PULLUP);
-  for (size_t i = 0; i < NUM_HAT; i++) pinMode(hatPins[i], INPUT_PULLUP);
+  for (size_t i = 0; i < NUM_INPUTS; i++) pinMode(digitalPins[i], INPUT_PULLUP);
+  for (size_t i = 0; i < NUM_HAT; i++)
+    if (validInput(hatInputs[i])) inputRole[hatInputs[i] - 1] = ROLE_HAT;
   for (size_t i = 0; i < NUM_ENCODERS; i++) {
-    pinMode(encoderPins[i].a, INPUT_PULLUP);
-    pinMode(encoderPins[i].b, INPUT_PULLUP);
     encoders[i].active = -1;
+    if (!encoderOk(i)) continue;
+    inputRole[encoderCfg[i].a - 1] = ROLE_ENCODER;
+    inputRole[encoderCfg[i].b - 1] = ROLE_ENCODER;
   }
   delayMicroseconds(100);  // let pull-ups settle
-  for (size_t i = 0; i < NUM_ENCODERS; i++) encoders[i].prev = readEncoderAB(i);
+  for (size_t i = 0; i < NUM_ENCODERS; i++)
+    if (encoderOk(i)) encoders[i].prev = readEncoderAB(i);
 
   memset(&lastReport, 0xFF, sizeof(lastReport));
 }
@@ -247,7 +244,7 @@ void loop() {
   lastTick += 1000;
   if (micros() - lastTick > 10000) lastTick = micros();  // don't try to catch up after a stall
 
-  scanSwitches();
+  scanInputs();
   tickEncoders();
   buildReport(report);
 
