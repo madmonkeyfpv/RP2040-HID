@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Add MCP3208 + 4x 74HC165 + WAGO 233 terminals to the rp2040-basic EasyEDA
+"""Add MCP3208 + 4x 74HC165 + WAGO 250 terminals to the rp2040-basic EasyEDA
 (Standard) schematic and PCB, leaving every existing part and track as is.
 
 Usage: gen_easyeda.py SCH_IN PCB_IN OUT_DIR
@@ -204,11 +204,23 @@ def fp_c0402(part, cx, cy, nets):
     return pcb_lib(part, cx, cy, "", prims)
 
 
-def fp_wago233(part, p1, step, front, nets, labels):
-    """WAGO 233-5xx, 2.54 mm. p1 = pole 1 pin, step = (dx, dy) to next pole,
-    front = unit vector towards the wire entry (board edge)."""
+# WAGO 250-1xx: 3.5 mm pitch, one in-line solder pin per pole, 12 mm deep,
+# body n * 3.5 + 1.5 mm wide, 45 degree conductor entry over the front edge.
+W250_PITCH = 13.7795      # 3.5 mm
+W250_FRONT = 13.7795      # pin row to front (wire entry) edge, 3.5 mm
+W250_REAR = 33.4646       # pin row to rear edge, 8.5 mm
+W250_END = 2.9528         # body overhang past the outer half-pitch, 0.75 mm
+
+
+def wago250_length(n):
+    return n * W250_PITCH + 2 * W250_END
+
+
+def fp_wago250(part, p1, step, front, nets, labels):
+    """p1 = pole 1 pin, step = unit vector to the next pole, front = unit
+    vector towards the wire entry (board edge)."""
     n = len(nets)
-    sx, sy = step[0] / 10.0, step[1] / 10.0
+    sx, sy = step
     fx, fy = front
     rot = {(0, 1): "", (-1, 0): "90", (0, -1): "180", (1, 0): "270"}[front]
 
@@ -217,24 +229,29 @@ def fp_wago233(part, p1, step, front, nets, labels):
 
     prims = []
     for i in range(n):
-        x, y = at(10 * i, 0)
-        prims.append(th_pad(x, y, 6.7, 1.9685, nets[i], i + 1, square=(i == 0)))
+        x, y = at(W250_PITCH * i, 0)
+        prims.append(th_pad(x, y, 7.0866, 1.9685, nets[i], i + 1, square=(i == 0)))
         part.pads[i + 1] = nets[i]
         # Pole labels sit just behind the body. Edge-on strips (top/bottom) are
-        # limited to the 2.54 mm pitch; side strips can use full names.
+        # limited to the pitch; side strips can use full names.
         side = front[1] == 0
-        size = 3.6 if side or len(labels[i]) <= 2 else 3.0
+        size = 3.6 if side or len(labels[i]) <= 3 else 3.0
         _, w, _ = text_metrics(labels[i], size)
-        lx, ly = at(10 * i, -(11 + w / 2) if side else -14)
+        lx, ly = at(W250_PITCH * i, -(W250_REAR + 3 + w / 2) if side else -(W250_REAR + 5))
         prims.append(pcb_text("L", labels[i], lx, ly, size=size, center=True))
-    a, b, c, d = at(-5, -8), at(10 * n - 5, -8), at(10 * n - 5, 27.5), at(-5, 27.5)
+    half = W250_PITCH / 2 + W250_END
+    last = W250_PITCH * (n - 1)
+    a, b = at(-half, -W250_REAR), at(last + half, -W250_REAR)
+    c, d = at(last + half, W250_FRONT), at(-half, W250_FRONT)
     prims.append(silk(a, b, c, d, a))
-    # wire-entry side: a tick per pole marks the push-button slots
+    # push-button marks, one per pole, on the rear half of the body
     for i in range(n):
-        prims.append(silk(at(10 * i - 2, 20), at(10 * i + 2, 20), w=0.6))
-    tx, ty = at(-12, -20)
+        prims.append(silk(at(W250_PITCH * i - 3, -20), at(W250_PITCH * i + 3, -20),
+                          at(W250_PITCH * i + 3, -12), at(W250_PITCH * i - 3, -12),
+                          at(W250_PITCH * i - 3, -20), w=0.6))
+    tx, ty = at(last + half + 7, -W250_REAR / 2)   # just past the last pole
     prims.insert(0, pcb_text("P", part.ref, tx, ty, size=4.5, center=True))
-    cx, cy = at(5 * (n - 1), 0)
+    cx, cy = at(last / 2, 0)
     prims.insert(1, pcb_text("N", part.value, cx, cy, hidden=True, center=True))
     return pcb_lib(part, cx, cy, rot, prims)
 
@@ -353,8 +370,8 @@ def mk_rn(ref):
 
 
 def mk_wago(ref, poles):
-    mpn = "233-5%02d" % poles
-    pkg = "WAGO-233-5%02d_P2.54" % poles
+    mpn = "250-1%02d" % poles
+    pkg = "WAGO-250-1%02d_P3.50" % poles
     sp = para([("package", pkg), ("Manufacturer", "WAGO"), ("Manufacturer Part", mpn), ("Supplier", ""),
                ("Supplier Part", ""), ("spicePre", "J"), ("spiceSymbolName", mpn)])
     pp = para([("package", pkg), ("BOM_Manufacturer", "WAGO"), ("BOM_Manufacturer Part", mpn),
@@ -363,6 +380,39 @@ def mk_wago(ref, poles):
 
 
 SOIC16 = "SOIC-16_L9.9-W3.9-P1.27-LS6.0-BL"
+
+# ---------------------------------------------------------------------------
+# Board and placement (PCB units). The board grows left and down only; the
+# RP2040 block, USB-B (top right) and the original top/right edges stay put.
+# ---------------------------------------------------------------------------
+X0, X1, Y0, Y1 = 3710, 4261, 3059.5, 3512.5        # ~140 x 115 mm
+EDGE = 2 + W250_FRONT                               # board edge to pin row
+BOTTOM_PINS, TOP_PINS = Y1 - EDGE, Y0 + EDGE
+LEFT_PINS, RIGHT_PINS = X0 + EDGE, X1 - EDGE
+
+
+def first_pole(start):
+    """Pole-1 position for a strip whose body starts at `start`."""
+    return start + W250_PITCH / 2 + W250_END
+
+
+L10 = wago250_length(10)
+# bottom: J3 J4 J5, 4 mm apart, from 11 mm in from the left edge
+BOT_START = [X0 + 44 + k * (L10 + 16) for k in range(3)]
+WAGO_BTN = [((first_pole(BOT_START[k]), BOTTOM_PINS), (1, 0), (0, 1)) for k in range(3)]
+WAGO_BTN.append(((RIGHT_PINS, first_pole(3200)), (0, 1), (1, 0)))      # J6, right edge
+WAGO_AX = [((LEFT_PINS, first_pole(3100)), (0, 1), (-1, 0)),             # J1
+           ((LEFT_PINS, first_pole(3100 + wago250_length(12) + 10)), (0, 1), (-1, 0))]  # J2
+WAGO_J7 = ((first_pole(3770), TOP_PINS), (1, 0), (0, -1))
+WAGO_J8 = ((first_pole(3770 + L10 + 20), TOP_PINS), (1, 0), (0, -1))
+WAGO_J9 = ((RIGHT_PINS, first_pole(3200 + L10 + 14)), (0, 1), (1, 0))
+
+BOT_CENTRE = [first_pole(BOT_START[k]) + 4.5 * W250_PITCH for k in range(3)]
+SR_X = [BOT_CENTRE[0], BOT_CENTRE[1], BOT_CENTRE[2], (BOT_CENTRE[1] + BOT_CENTRE[2]) / 2]
+SR_Y = 3395
+RN_Y = 3440
+RN_POS = [(x + dx, RN_Y) for x in SR_X for dx in (-13, 13)]
+U9_POS = (3810, 3280)
 AXIS_NAMES = ["X", "Y", "Z", "RX", "RY", "RZ", "S1", "S2"]
 
 # RP2040 pad number -> new net (pads 2-9 GP0-7, 11-18 GP8-15, 27-34 GP16-22, 38-40 GP26-28)
@@ -395,7 +445,7 @@ s2 = []
 frame = [x for x in sheet1 if "frame_lib" in x][0]
 s2.append(re.sub(r"gge\w+", lambda m: gid(), frame))
 s2.append("T~L~60~-1090~0~#0000FF~~24pt~~~~comment~IO expansion: MCP3208 (8 axes), 4x 74HC165 (32 buttons), "
-          "WAGO 233 terminals~1~start~%s~0~pinpart" % gid())
+          "WAGO 250 terminals~1~start~%s~0~pinpart" % gid())
 s2.append("T~L~60~-1065~0~#0000FF~~9pt~~~~comment~Firmware: build with MCP3208_ENABLED 1 and SHIFT_REG_ENABLED 1 "
           "(default Pico pins). Chip 1 (U10) is nearest the RP2040: its A-H are buttons 1-8.~1~start~%s~0~pinpart" % gid())
 
@@ -411,7 +461,7 @@ s2 += symbol(u9, 140, -1000, 70,
              [(i + 1, "CH%d" % i, mcp_nets[i + 1]) for i in range(8)],
              [(16, "VDD", V33), (15, "VREF", V33), (14, "AGND", GND), (13, "CLK", "ADC_SCK"),
               (12, "DOUT", "ADC_MISO"), (11, "DIN", "ADC_MOSI"), (10, "CS", "ADC_CS"), (9, "DGND", GND)])
-pcb_add.append(fp_soic16(u9, 3870, 3255, mcp_nets))
+pcb_add.append(fp_soic16(u9, U9_POS[0], U9_POS[1], mcp_nets))
 
 caps = []
 
@@ -430,8 +480,8 @@ def cap(ref, val, mpn, sx, sy, px, py):
     pcb_add.append(fp_c0402(c, px, py, {1: V33, 2: GND}))
 
 
-cap("PC17", "100nF", C100N, 360, -1000, 3893, 3233)
-cap("PC22", "1uF", C1U, 360, -955, 3893, 3226)
+cap("PC17", "100nF", C100N, 360, -1000, U9_POS[0] + 23, U9_POS[1] - 22)
+cap("PC22", "1uF", C1U, 360, -955, U9_POS[0] + 23, U9_POS[1] - 29)
 s2.append("T~L~330~-1020~0~#0000FF~~9pt~~~~comment~Place next to U9 pins 15/16~1~start~%s~0~pinpart" % gid())
 
 # --- WAGO axis terminals J1, J2 ------------------------------------------
@@ -440,7 +490,7 @@ def wago(ref, nets, labels, sx, sy, p1, step, front, title):
     parts.append(j)
     s2.extend(symbol(j, sx, sy, 50, [(i + 1, labels[i], nets[i]) for i in range(len(nets))], []))
     s2.append("T~L~%s~%s~0~#0000FF~~9pt~~~~comment~%s~1~start~%s~0~pinpart" % (sx - 40, sy - 18, title, gid()))
-    pcb_add.append(fp_wago233(j, p1, step, front, nets, labels))
+    pcb_add.append(fp_wago250(j, p1, step, front, nets, labels))
 
 
 for k in range(2):
@@ -448,17 +498,10 @@ for k in range(2):
     for a in range(4 * k, 4 * k + 4):
         nets += [V33, "AX%d" % (a + 1), GND]
         labels += ["3V3", AXIS_NAMES[a], "GND"]
-    wago("J%d" % (k + 1), nets, labels, 560 + 150 * k, -1010, (3818.5, 3135 + 132 * k), (0, 10), (-1, 0),
+    wago("J%d" % (k + 1), nets, labels, 560 + 150 * k, -1010, *WAGO_AX[k],
          "Axes %d-%d (+3V3 / signal / GND)" % (4 * k + 1, 4 * k + 4))
 
 # --- 74HC165 chain -------------------------------------------------------------
-SR_X = [3885, 3995, 4105, 4170]
-SR_Y = 3360
-WAGO_BTN = [((3840, 3424), (10, 0), (0, 1)), ((3950, 3424), (10, 0), (0, 1)),
-            ((4060, 3424), (10, 0), (0, 1)), ((4231.5, 3187), (0, 10), (1, 0))]
-RN_POS = [(3872, 3398), (3898, 3398), (3982, 3398), (4008, 3398), (4092, 3398), (4118, 3398),
-          (4160, 3400), (4186, 3400)]
-
 for k in range(4):
     ref = "U%d" % (10 + k)
     u = mk_ic(ref, "74HC165", "Nexperia", "74HC165D,653", SOIC16)
@@ -503,11 +546,11 @@ for k in range(4):
 
 # --- spare GPIO terminals --------------------------------------------------
 wago("J7", ["GP%d" % i for i in range(8)] + [GND, GND], ["P%d" % i for i in range(8)] + ["G", "G"],
-     1400, -1010, (3855, 3089), (10, 0), (0, -1), "Spare GP0-7 (hat / encoders)")
+     1400, -1010, *WAGO_J7, "Spare GP0-7 (hat / encoders)")
 wago("J8", ["GP%d" % i for i in range(8, 16)] + [GND, GND], ["P%d" % i for i in range(8, 16)] + ["G", "G"],
-     1400, -830, (3977, 3089), (10, 0), (0, -1), "Spare GP8-15")
+     1400, -830, *WAGO_J8, "Spare GP8-15")
 wago("J9", [V33, "GP26", "GP27", "GP28", GND, GND], ["3V3", "GP26", "GP27", "GP28", "GND", "GND"],
-     1400, -650, (4231.5, 3320), (0, 10), (1, 0), "Spare GP26-28")
+     1400, -650, *WAGO_J9, "Spare GP26-28")
 
 # ---------------------------------------------------------------------------
 # PCB: RP2040 pad nets, board outline, holes, pours
@@ -524,7 +567,6 @@ for idx, s in enumerate(shapes):
                     prims[j] = "~".join(fl)
         shapes[idx] = "#@$".join(prims)
 
-X0, X1, Y0, Y1 = 3789, 4261, 3059.5, 3453.5
 for idx, s in enumerate(shapes):
     if s.startswith("COPPERAREA"):
         fl = s.split("~")
@@ -537,9 +579,9 @@ for idx, s in enumerate(shapes):
         shapes[idx] = "~".join(fl)
 
 shapes.append("TRACK~1~10~~%s %s %s %s %s %s %s %s %s %s~%s~0" % (X0, Y0, X1, Y0, X1, Y1, X0, Y1, X0, Y0, gid()))
-for hx, hy in [(3805, 3075.5), (3805, 3437.5), (4245, 3437.5)]:
+for hx, hy in [(X0 + 16, Y0 + 16), (X0 + 16, Y1 - 16), (X1 - 16, Y1 - 16)]:
     shapes.append("HOLE~%s~%s~6.2992~%s~0" % (hx, hy, gid()))
-shapes.append(pcb_text("L", "RP2040-HID", 3950, 3200, size=8))
+shapes.append(pcb_text("L", "RP2040-HID", 3880, 3190, size=8))
 shapes.extend(pcb_add)
 pcb["BBox"] = {"x": X0, "y": Y0, "width": X1 - X0, "height": Y1 - Y0}
 
